@@ -1,0 +1,427 @@
+"""NKI implementation of history-only PCP attention.
+
+The code is deliberately direct.  It keeps Q and online-softmax state in SBUF,
+uses shared-HBM ping/pong communication buffers, and processes one 128-token
+KV tile at a time.  Optimized layouts and scheduling are future work.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .config import PCPAttentionConfig
+
+
+def pack_local_kv(k: Any, v: Any) -> Any:
+    """Pack cache tensors for the kernel's contiguous ring payload.
+
+    Input shapes are ``[blocks, Hkv, block_size, D]``.  The returned tensor is
+    ``[blocks, 2 * Hkv * block_size * D]`` with all K followed by all V in each
+    block.  ``Any`` keeps importing this module from requiring torch or NKI.
+    """
+
+    import torch
+
+    if k.shape != v.shape or k.ndim != 4:
+        raise ValueError("K and V must have equal [blocks, Hkv, block, D] shapes")
+    return torch.stack((k, v), dim=1).reshape(k.shape[0], -1).contiguous()
+
+
+def make_history_attention_kernel(config: PCPAttentionConfig):
+    """Build a JIT kernel specialized for every field except actual length.
+
+    ``block_valid_mask_ref`` is generated at runtime from actual history
+    length.  The current compiler rejects collectives inside device-side
+    dynamic loops, so the first hardware version executes the maximum static
+    block count and masks blocks beyond the runtime length.
+    """
+
+    config.validate()
+    if config.num_kv_heads != config.lnc:
+        raise ValueError(
+            "first NKI kernel requires one KV head per LNC core "
+            f"(num_kv_heads={config.num_kv_heads}, lnc={config.lnc})"
+        )
+
+    import nki
+    global ncc, nisa, nl
+    import nki.collectives as ncc
+    import nki.isa as nisa
+    import nki.language as nl
+
+    pcp_size = config.pcp_size
+    q_len = config.local_q_len
+    block_size = config.block_size
+    num_q_heads = config.num_q_heads
+    num_kv_heads = config.num_kv_heads
+    head_dim = config.head_dim
+    lnc = config.lnc
+    max_local_blocks = config.max_local_blocks
+    heads_per_core = num_q_heads // lnc
+    kv_heads_per_core = num_kv_heads // lnc
+    q_per_kv = num_q_heads // num_kv_heads
+    d_tiles = head_dim // 128
+    kv_tiles = block_size // 128
+    payload_elements = 2 * num_kv_heads * block_size * head_dim
+    replica_group_spec = (tuple(range(pcp_size)),)
+    softmax_scale = config.softmax_scale
+
+    @nki.jit
+    def history_attention_kernel(
+        q_ref,
+        local_kv_ref,
+        block_valid_mask_ref,
+        pcp_size=pcp_size,
+        q_len=q_len,
+        block_size=block_size,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        lnc=lnc,
+        max_local_blocks=max_local_blocks,
+        heads_per_core=heads_per_core,
+        kv_heads_per_core=kv_heads_per_core,
+        q_per_kv=q_per_kv,
+        d_tiles=d_tiles,
+        kv_tiles=kv_tiles,
+        payload_elements=payload_elements,
+        replica_group_spec=replica_group_spec,
+        softmax_scale=softmax_scale,
+    ):
+        assert tuple(q_ref.shape) == (num_q_heads, q_len, head_dim)
+        assert tuple(local_kv_ref.shape) == (max_local_blocks, payload_elements)
+        assert tuple(block_valid_mask_ref.shape) == (
+            max_local_blocks,
+            kv_tiles,
+            q_len,
+            128,
+        )
+        replica_group = ncc.ReplicaGroup(replica_group_spec)
+
+        # All kernel I/O and collective endpoints are shared HBM under LNC2.
+        out_ref = nl.ndarray(q_ref.shape, dtype=q_ref.dtype, buffer=nl.shared_hbm)
+        comm0 = nl.ndarray(
+            (2, num_kv_heads, block_size, head_dim),
+            dtype=q_ref.dtype,
+            buffer=nl.shared_hbm,
+            name="kv_ping",
+        )
+        comm1 = nl.ndarray(
+            (2, num_kv_heads, block_size, head_dim),
+            dtype=q_ref.dtype,
+            buffer=nl.shared_hbm,
+            name="kv_pong",
+        )
+
+        core = nl.program_id(0)
+        # Q is loaded once, scaled once, and remains live in SBUF for the full
+        # outer loop.  Each LNC core owns a disjoint group of heads.
+        q_local = nl.ndarray(
+            (128, heads_per_core, d_tiles, q_len),
+            dtype=nl.bfloat16,
+            buffer=nl.sbuf,
+            name="resident_q",
+        )
+        for local_head in nl.static_range(heads_per_core):
+            global_head = core * heads_per_core + local_head
+            for d_tile in nl.static_range(d_tiles):
+                q_input = q_ref.select(0, global_head).slice(
+                    1, d_tile * 128, (d_tile + 1) * 128
+                )
+                q_tile = q_local.select(1, local_head).select(1, d_tile)
+                q_tile[:, :] = nl.multiply(
+                    nl.load_transpose2d(
+                        q_input,
+                        dtype=nl.bfloat16,
+                    ),
+                    softmax_scale,
+                )
+
+        running_max = nl.full(
+            (q_len, heads_per_core, 1),
+            fill_value=-9984.0,
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name="online_max",
+        )
+        running_sum = nl.zeros(
+            (q_len, heads_per_core, 1),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name="online_sum",
+        )
+        running_out = nl.zeros(
+            (q_len, heads_per_core, d_tiles, 128),
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name="online_numerator",
+        )
+        invalid_scores = nl.full(
+            (q_len, 128),
+            fill_value=-9984.0,
+            dtype=nl.float32,
+            buffer=nl.sbuf,
+            name="invalid_scores",
+        )
+
+        # neuronx-cc 2.27 rejects collective instructions inside a hardware
+        # dynamic loop.  Iterate over the compiled maximum and use a runtime
+        # score mask so one artifact still supports shorter actual histories.
+        for block_index in nl.static_range(max_local_blocks):
+            local_block = local_kv_ref.select(0, block_index).reshape(
+                (1, payload_elements)
+            )
+            if core == 0:
+                nisa.dma_copy(
+                    dst=comm0.reshape((1, payload_elements)),
+                    src=local_block,
+                )
+            nisa.core_barrier(data=comm0, cores=(0, 1))
+
+            # Static PCP size gives a fixed collective topology.  Collective
+            # starts before arithmetic; the barrier on its destination is the
+            # point at which both cores wait before consuming the next buffer.
+            for ring_step in nl.static_range(pcp_size):
+                if ring_step % 2 == 0:
+                    current, incoming = comm0, comm1
+                else:
+                    current, incoming = comm1, comm0
+
+                if pcp_size > 1:
+                    ncc.collective_permute_implicit(
+                        srcs_by_channel=[[current]],
+                        dsts_by_channel=[[incoming]],
+                        replica_group=replica_group,
+                        channel_ids=[0],
+                    )
+
+                # Keep the collective in the statically-unrolled ring, but
+                # execute heads in a device-side loop.  This avoids cloning
+                # the full attention body once per head (16x for Qwen) while
+                # respecting the compiler restriction that forbids a
+                # collective *inside* a dynamic loop.
+                def compute_head(local_head):
+                    # Contiguous head assignment means each physical core uses
+                    # its one corresponding Qwen KV head.  Keeping this static
+                    # avoids unsupported integer division of a device-loop
+                    # induction variable.
+                    kv_head = core
+
+                    # Materialize dynamically selected state into fixed-shape
+                    # SBUF tiles.  Tensor elementwise ops require static,
+                    # matching access shapes; only the entry/exit copies use
+                    # the dynamic head offset.
+                    head_max = nl.ndarray(
+                        (q_len, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    head_sum = nl.ndarray(
+                        (q_len, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    head_out = nl.ndarray(
+                        (q_len, d_tiles, 128),
+                        dtype=nl.float32,
+                        buffer=nl.sbuf,
+                    )
+                    head_q = nl.ndarray(
+                        (128, d_tiles, q_len),
+                        dtype=nl.bfloat16,
+                        buffer=nl.sbuf,
+                    )
+                    head_max[:, :] = nl.copy(
+                        running_max.select(1, local_head), dtype=nl.float32
+                    )
+                    head_sum[:, :] = nl.copy(
+                        running_sum.select(1, local_head), dtype=nl.float32
+                    )
+                    for state_d_tile in nl.static_range(d_tiles):
+                        head_q.select(1, state_d_tile)[:, :] = nl.copy(
+                            q_local.select(1, local_head).select(
+                                1, state_d_tile
+                            ),
+                            dtype=nl.bfloat16,
+                        )
+                        head_out.select(1, state_d_tile)[:, :] = nl.copy(
+                            running_out.select(1, local_head).select(
+                                1, state_d_tile
+                            ),
+                            dtype=nl.float32,
+                        )
+
+                    for kv_tile in nl.static_range(kv_tiles):
+                        block_valid_mask = nl.load(
+                            block_valid_mask_ref.select(0, block_index).select(
+                                0, kv_tile
+                            ),
+                            dtype=nl.uint8,
+                        )
+                        score_psum = nl.zeros(
+                            (q_len, 128),
+                            dtype=nl.float32,
+                            buffer=nl.psum,
+                        )
+                        for d_tile in nl.static_range(d_tiles):
+                            k_tile = nl.ndarray(
+                                (128, 128),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            current_k = current.select(0, 0).select(0, kv_head)
+                            current_k = current_k.slice(
+                                0, kv_tile * 128, (kv_tile + 1) * 128
+                            ).slice(1, d_tile * 128, (d_tile + 1) * 128)
+                            k_tile[:, :] = nl.load_transpose2d(
+                                current_k,
+                                dtype=nl.bfloat16,
+                            )
+                            nisa.nc_matmul(
+                                dst=score_psum,
+                                stationary=head_q.select(1, d_tile),
+                                moving=k_tile[:, :],
+                                accumulate=d_tile != 0,
+                            )
+
+                        scores = nl.where(
+                            block_valid_mask,
+                            nl.copy(score_psum, dtype=nl.float32),
+                            invalid_scores,
+                            dtype=nl.float32,
+                        )
+                        tile_max = nl.max(scores, axis=1, keepdims=True)
+                        old_max = head_max
+                        old_sum = head_sum
+                        new_max = nl.maximum(old_max, tile_max)
+                        alpha = nl.exp(
+                            nl.subtract(old_max, new_max)
+                        )
+                        probabilities = nl.exp(nl.subtract(scores, new_max))
+                        tile_sum = nl.sum(probabilities, axis=1, keepdims=True)
+
+                        probabilities_bf16 = nl.copy(
+                            probabilities, dtype=nl.bfloat16
+                        )
+                        probabilities_t = nl.ndarray(
+                            (128, q_len),
+                            dtype=nl.bfloat16,
+                            buffer=nl.sbuf,
+                        )
+                        probabilities_t_psum = nl.ndarray(
+                            (128, q_len),
+                            dtype=nl.bfloat16,
+                            buffer=nl.psum,
+                        )
+                        nisa.nc_transpose(
+                            dst=probabilities_t_psum,
+                            data=probabilities_bf16,
+                            engine=nisa.engine.tensor,
+                        )
+                        nisa.tensor_copy(
+                            dst=probabilities_t, src=probabilities_t_psum
+                        )
+
+                        for d_tile in nl.static_range(d_tiles):
+                            v_tile = nl.ndarray(
+                                (128, 128),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            current_v = current.select(0, 1).select(0, kv_head)
+                            current_v = current_v.slice(
+                                0, kv_tile * 128, (kv_tile + 1) * 128
+                            ).slice(1, d_tile * 128, (d_tile + 1) * 128)
+                            v_tile[:, :] = nl.load(
+                                current_v,
+                                dtype=nl.bfloat16,
+                            )
+                            pv_psum = nl.zeros(
+                                (128, q_len),
+                                dtype=nl.float32,
+                                buffer=nl.psum,
+                            )
+                            nisa.nc_matmul(
+                                dst=pv_psum,
+                                stationary=v_tile[:, :],
+                                moving=probabilities_t[:, :],
+                            )
+                            pv_dq = nl.ndarray(
+                                (128, q_len),
+                                dtype=nl.float32,
+                                buffer=nl.sbuf,
+                            )
+                            nisa.tensor_copy(dst=pv_dq, src=pv_psum)
+                            pv_qd = nl.ndarray(
+                                (q_len, 128),
+                                dtype=nl.float32,
+                                buffer=nl.sbuf,
+                            )
+                            pv_qd_psum = nl.ndarray(
+                                (q_len, 128),
+                                dtype=nl.float32,
+                                buffer=nl.psum,
+                            )
+                            nisa.nc_transpose(
+                                dst=pv_qd_psum,
+                                data=pv_dq,
+                                engine=nisa.engine.tensor,
+                            )
+                            nisa.tensor_copy(dst=pv_qd, src=pv_qd_psum)
+                            out_state = head_out.select(1, d_tile)
+                            out_state[:, :] = nl.add(
+                                nl.multiply(
+                                    out_state, alpha
+                                ),
+                                pv_qd,
+                            )
+
+                        old_sum[:, :] = nl.add(
+                            nl.multiply(old_sum, alpha),
+                            tile_sum,
+                        )
+                        old_max[:, :] = nl.copy(new_max, dtype=nl.float32)
+
+                    running_max.select(1, local_head)[:, :] = nl.copy(
+                        head_max, dtype=nl.float32
+                    )
+                    running_sum.select(1, local_head)[:, :] = nl.copy(
+                        head_sum, dtype=nl.float32
+                    )
+                    for state_d_tile in nl.static_range(d_tiles):
+                        running_out.select(1, local_head).select(
+                            1, state_d_tile
+                        )[:, :] = nl.copy(
+                            head_out.select(1, state_d_tile), dtype=nl.float32
+                        )
+
+                nl.fori_loop(0, heads_per_core, compute_head)
+
+                if pcp_size > 1:
+                    nisa.core_barrier(data=incoming, cores=(0, 1))
+
+        for local_head in nl.static_range(heads_per_core):
+            global_head = core * heads_per_core + local_head
+            for d_tile in nl.static_range(d_tiles):
+                out_state = running_out.select(1, local_head).select(1, d_tile)
+                sum_state = running_sum.select(1, local_head)
+                inverse_sum = nl.ndarray(
+                    (q_len, 1), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.reciprocal(dst=inverse_sum, data=sum_state)
+                normalized = nl.multiply(out_state, inverse_sum)
+                output_tile = out_ref.select(0, global_head).slice(
+                    1, d_tile * 128, (d_tile + 1) * 128
+                )
+                nl.store(
+                    output_tile,
+                    value=nl.copy(normalized, dtype=q_ref.dtype),
+                )
+        nisa.core_barrier(data=out_ref, cores=(0, 1))
+        return out_ref
+
+    return history_attention_kernel
+
+
+def wrap_for_native_torch(config: PCPAttentionConfig):
+    """Return a native-PyTorch callable using the installed libtorch bridge."""
+
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    return wrap_nki(make_history_attention_kernel(config))[config.lnc]

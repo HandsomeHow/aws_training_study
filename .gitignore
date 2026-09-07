@@ -1,0 +1,32 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and editor state
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Neuron compiler caches and generated artifacts
+.profile_cache/
+neuronxcc-*/
+*.colz
+*.done
+*.neff
+*.ntff
+*.pftrace
+*.bundle
+log-neuron-cc.txt
+global_metric_store.json
+
+# Neuron Explorer captures and databases
+profiles/
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.pb

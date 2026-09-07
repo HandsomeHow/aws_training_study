@@ -1,0 +1,9 @@
+# Known-working versions on the AWS Neuron 2.32 Trn2 environment used by
+# this POC. Neuron packages must be installed from the AWS Neuron package
+# repository rather than the default PyPI index alone.
+torch==2.11.0
+numpy==2.3.5
+pytest==9.1.1
+torch-xla==2.11.0
+neuronx-cc==2.27.5334.0+f702b353
+libtorch-neuronx-lite==2.11.0.1.0.1284+f49d8626
