@@ -25,6 +25,7 @@ class PCPAttentionConfig:
     head_dim: int = 256
     lnc: int = 2
     alignment: int = 4096
+    pretranspose_k_on_owner: bool = False
 
     @property
     def softmax_scale(self) -> float:
@@ -99,8 +100,11 @@ class PCPAttentionConfig:
                     f"{name} must be divisible by pcp_size * interleave_size "
                     f"({self.rank_stride}), got {value}"
                 )
-        if self.local_q_len > 128:
-            raise ValueError("first NKI version requires local_q_len <= 128")
+        if self.local_q_len > 128 and self.local_q_len % 128:
+            raise ValueError(
+                "local_q_len values above 128 must be divisible by the "
+                "128-token NKI Q tile"
+            )
         return self
 
 

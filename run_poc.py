@@ -44,6 +44,14 @@ def parse_args() -> argparse.Namespace:
         default="bf16",
         help="storage and ring-communication dtype for the historical K/V cache",
     )
+    parser.add_argument(
+        "--pretranspose-k-on-owner",
+        action="store_true",
+        help=(
+            "transpose each K tile once on its owner rank before placing it "
+            "in the ring buffers"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--check", choices=("full", "sampled", "none"), default="full")
     parser.add_argument(
@@ -78,8 +86,10 @@ def make_config(args: argparse.Namespace) -> PCPAttentionConfig:
             "num_q_heads",
             "num_kv_heads",
             "head_dim",
+            "pretranspose_k_on_owner",
         )
         if getattr(args, name) is not None
+        and (name != "pretranspose_k_on_owner" or getattr(args, name))
     }
     return cfg.with_overrides(**overrides)
 
