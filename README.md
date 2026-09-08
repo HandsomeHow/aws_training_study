@@ -92,17 +92,32 @@ torchrun --standalone --nproc_per_node=64 run_poc.py \
   --benchmark-iterations 20 --benchmark-warmups 1
 ```
 
-On the current `trn2.48xlarge`, one run produced:
+Store and communicate historical K/V in FP8 E4M3 while keeping Q and the
+Tensor Engine operands in BF16:
 
-```text
-min=182.927 ms, median=183.638 ms, mean=184.046 ms,
-P90=185.003 ms, max=188.024 ms
+```bash
+torchrun --standalone --nproc_per_node=64 run_poc.py \
+  --backend neuron --preset full --pcp-size 64 --check none \
+  --kv-dtype fp8_e4m3fn \
+  --benchmark-iterations 20 --benchmark-warmups 1
 ```
 
-The mean corresponds to about 22,255 global current tokens/s for the 4096-token
-request.  This is end-to-end compiled-call latency, including normal launch and
-the one-element synchronization marker; compilation, input construction, and
-the Gloo timing barrier are outside the measured interval.
+On the current `trn2.48xlarge`, 20-call runs produced:
+
+```text
+BF16 KV: min=182.927 ms, median=183.638 ms, mean=184.046 ms,
+          P90=185.003 ms, max=188.024 ms
+FP8 KV:  min=192.200 ms, median=193.111 ms, mean=193.097 ms,
+          P90=193.662 ms, max=193.864 ms
+```
+
+The means correspond to about 22,255 BF16-KV and 21,212 FP8-KV global current
+tokens/s for the 4096-token request.  This FP8 POC lowers cache and ring traffic,
+but is slower because Trainium2 cannot directly DMA-transpose FP8 K tiles; the
+kernel converts each K tile to BF16 and transposes it on chip before matmul.
+These are end-to-end compiled-call latencies, including normal launch and the
+one-element synchronization marker; compilation, input construction, and the
+Gloo timing barrier are outside the measured interval.
 
 Capturing all repetitions inside one outer `torch.compile` graph was also
 tested, but this compiler version inlines the complete NKI body once per call,

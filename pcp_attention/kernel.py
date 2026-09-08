@@ -98,17 +98,19 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         )
         replica_group = ncc.ReplicaGroup(replica_group_spec)
 
-        # All kernel I/O and collective endpoints are shared HBM under LNC2.
+        # Collective endpoints use the historical KV storage dtype. This keeps
+        # FP8 caches compressed while they circulate through the HBM ring;
+        # individual tiles are converted to BF16 only when loaded into SBUF.
         out_ref = nl.ndarray(q_ref.shape, dtype=q_ref.dtype, buffer=nl.shared_hbm)
         comm0 = nl.ndarray(
             (2, num_kv_heads, block_size, head_dim),
-            dtype=q_ref.dtype,
+            dtype=local_kv_ref.dtype,
             buffer=nl.shared_hbm,
             name="kv_ping",
         )
         comm1 = nl.ndarray(
             (2, num_kv_heads, block_size, head_dim),
-            dtype=q_ref.dtype,
+            dtype=local_kv_ref.dtype,
             buffer=nl.shared_hbm,
             name="kv_pong",
         )
@@ -269,10 +271,38 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             current_k = current_k.slice(
                                 0, kv_tile * 128, (kv_tile + 1) * 128
                             ).slice(1, d_tile * 128, (d_tile + 1) * 128)
-                            k_tile[:, :] = nl.load_transpose2d(
-                                current_k,
-                                dtype=nl.bfloat16,
-                            )
+                            if local_kv_ref.dtype == nl.bfloat16:
+                                k_tile[:, :] = nl.load_transpose2d(
+                                    current_k,
+                                    dtype=nl.bfloat16,
+                                )
+                            else:
+                                k_tile_untransposed = nl.ndarray(
+                                    (128, 128),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.sbuf,
+                                )
+                                k_tile_transposed_psum = nl.ndarray(
+                                    (128, 128),
+                                    dtype=nl.bfloat16,
+                                    buffer=nl.psum,
+                                )
+                                # DMA transpose does not support FP8 input.
+                                # Convert during a regular HBM-to-SBUF load,
+                                # then transpose the BF16 tile on TensorE.
+                                k_tile_untransposed[:, :] = nl.load(
+                                    current_k,
+                                    dtype=nl.bfloat16,
+                                )
+                                nisa.nc_transpose(
+                                    dst=k_tile_transposed_psum,
+                                    data=k_tile_untransposed,
+                                    engine=nisa.engine.tensor,
+                                )
+                                nisa.tensor_copy(
+                                    dst=k_tile,
+                                    src=k_tile_transposed_psum,
+                                )
                             nisa.nc_matmul(
                                 dst=score_psum,
                                 stationary=head_q.select(1, d_tile),
