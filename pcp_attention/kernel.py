@@ -285,7 +285,12 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                 else:
                     current, incoming = comm1, comm0
 
-                if pcp_size > 1:
+                # The final payload has already visited every rank. Sending it
+                # once more would only return it to its owner, and the result
+                # is never consumed, so omit that collective and its tail
+                # barrier.
+                has_next_ring_step = ring_step + 1 < pcp_size
+                if pcp_size > 1 and has_next_ring_step:
                     ncc.collective_permute_implicit(
                         srcs_by_channel=[[current]],
                         dsts_by_channel=[[incoming]],
@@ -502,7 +507,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 new_max, dtype=nl.float32
                             )
 
-                if pcp_size > 1:
+                if pcp_size > 1 and has_next_ring_step:
                     nisa.core_barrier(data=incoming, cores=(0, 1))
 
         for head_group in nl.static_range(head_groups):
