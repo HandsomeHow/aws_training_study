@@ -433,11 +433,24 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             tile_max = nl.max(scores, axis=1, keepdims=True)
                             new_max = nl.maximum(head_max, tile_max)
                             alpha = nl.exp(nl.subtract(head_max, new_max))
-                            probabilities = nl.exp(
-                                nl.subtract(scores, new_max)
+                            probabilities = nl.ndarray(
+                                (compute_rows, 128),
+                                dtype=nl.float32,
+                                buffer=nl.sbuf,
                             )
-                            tile_sum = nl.sum(
-                                probabilities, axis=1, keepdims=True
+                            tile_sum = nl.ndarray(
+                                (compute_rows, 1),
+                                dtype=nl.float32,
+                                buffer=nl.sbuf,
+                            )
+                            nisa.activation(
+                                dst=probabilities,
+                                op=nl.exp,
+                                data=scores,
+                                bias=nl.negative(new_max),
+                                reduce_op=nl.add,
+                                reduce_res=tile_sum,
+                                reduce_cmd=nisa.reduce_cmd.reset_reduce,
                             )
 
                             probabilities_bf16 = nl.copy(
