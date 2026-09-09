@@ -191,7 +191,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
             name="online_numerator",
         )
         invalid_scores = nl.full(
-            (compute_rows, 128),
+            (compute_rows, block_size),
             fill_value=-9984.0,
             dtype=nl.float32,
             buffer=nl.sbuf,
@@ -308,17 +308,29 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                 for q_chunk in nl.static_range(q_tiles):
                     q_start = q_chunk * q_tile_size
                     q_end = q_start + q_tile_size
+                    block_valid_mask = nl.ndarray(
+                        (compute_rows, block_size),
+                        dtype=nl.uint8,
+                        buffer=nl.sbuf,
+                    )
+                    resident_k = nl.ndarray(
+                        (128, d_tiles, block_size),
+                        dtype=nl.bfloat16,
+                        buffer=nl.sbuf,
+                    )
+                    resident_v = nl.ndarray(
+                        (128, kv_tiles, d_tiles, 128),
+                        dtype=nl.bfloat16,
+                        buffer=nl.sbuf,
+                    )
                     for kv_tile in nl.static_range(kv_tiles):
+                        kv_start = kv_tile * 128
+                        kv_end = kv_start + 128
                         base_block_valid_mask = nl.load(
                             block_valid_mask_ref.select(
                                 0, block_index
                             ).select(0, kv_tile).slice(0, q_start, q_end),
                             dtype=nl.uint8,
-                        )
-                        block_valid_mask = nl.ndarray(
-                            (compute_rows, 128),
-                            dtype=nl.uint8,
-                            buffer=nl.sbuf,
                         )
                         for group_head in nl.static_range(
                             heads_per_compute_tile
@@ -327,20 +339,10 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             row_end = row_start + q_tile_size
                             block_valid_mask.slice(
                                 0, row_start, row_end
-                            )[:, :] = nl.copy(
+                            ).slice(1, kv_start, kv_end)[:, :] = nl.copy(
                                 base_block_valid_mask,
                                 dtype=nl.uint8,
                             )
-                        resident_k = nl.ndarray(
-                            (128, d_tiles, 128),
-                            dtype=nl.bfloat16,
-                            buffer=nl.sbuf,
-                        )
-                        resident_v = nl.ndarray(
-                            (128, d_tiles, 128),
-                            dtype=nl.bfloat16,
-                            buffer=nl.sbuf,
-                        )
                         for d_tile in nl.static_range(d_tiles):
                             current_k = current.select(0, 0).select(
                                 0, kv_head
@@ -349,7 +351,9 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             ).slice(
                                 1, d_tile * 128, (d_tile + 1) * 128
                             )
-                            k_tile = resident_k.select(1, d_tile)
+                            k_tile = resident_k.select(1, d_tile).slice(
+                                1, kv_start, kv_end
+                            )
                             if pretranspose_k_on_owner:
                                 k_tile[:, :] = nl.load(
                                     current_k,
@@ -392,75 +396,83 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             ).slice(
                                 1, d_tile * 128, (d_tile + 1) * 128
                             )
-                            resident_v.select(1, d_tile)[:, :] = nl.load(
-                                current_v,
-                                dtype=nl.bfloat16,
+                            resident_v.select(1, kv_tile).select(
+                                1, d_tile
+                            )[:, :] = nl.load(
+                                current_v, dtype=nl.bfloat16
                             )
 
-                        for head_group in nl.static_range(head_groups):
-                            head_max = running_max.select(
-                                1, q_chunk
-                            ).select(1, head_group)
-                            head_sum = running_sum.select(
-                                1, q_chunk
-                            ).select(1, head_group)
-                            head_out = running_out.select(
-                                1, q_chunk
-                            ).select(1, head_group)
-                            head_q = q_local.select(1, q_chunk).select(
-                                1, head_group
+                    # Fuse all four 128-token KV tiles in the cache block into
+                    # one 512-column QK/softmax. This updates online state once
+                    # per block and keeps Q stationary while all K columns
+                    # stream through TensorE.
+                    for head_group in nl.static_range(head_groups):
+                        head_max = running_max.select(
+                            1, q_chunk
+                        ).select(1, head_group)
+                        head_sum = running_sum.select(
+                            1, q_chunk
+                        ).select(1, head_group)
+                        head_out = running_out.select(
+                            1, q_chunk
+                        ).select(1, head_group)
+                        head_q = q_local.select(1, q_chunk).select(
+                            1, head_group
+                        )
+
+                        score_psum = nl.ndarray(
+                            (compute_rows, block_size),
+                            dtype=nl.float32,
+                            buffer=nl.psum,
+                        )
+                        for d_tile in nl.static_range(d_tiles):
+                            nisa.nc_matmul(
+                                dst=score_psum,
+                                stationary=head_q.select(1, d_tile),
+                                moving=resident_k.select(1, d_tile),
+                                accumulate=d_tile != 0,
                             )
 
-                            score_psum = nl.zeros(
-                                (compute_rows, 128),
-                                dtype=nl.float32,
-                                buffer=nl.psum,
-                            )
-                            for d_tile in nl.static_range(d_tiles):
-                                nisa.nc_matmul(
-                                    dst=score_psum,
-                                    stationary=head_q.select(1, d_tile),
-                                    moving=resident_k.select(1, d_tile),
-                                    accumulate=d_tile != 0,
-                                )
+                        scores = nl.where(
+                            block_valid_mask,
+                            nl.copy(score_psum, dtype=nl.float32),
+                            invalid_scores,
+                            dtype=nl.float32,
+                        )
+                        tile_max = nl.max(scores, axis=1, keepdims=True)
+                        new_max = nl.maximum(head_max, tile_max)
+                        alpha = nl.exp(nl.subtract(head_max, new_max))
+                        probabilities = nl.ndarray(
+                            (compute_rows, block_size),
+                            dtype=nl.float32,
+                            buffer=nl.sbuf,
+                        )
+                        tile_sum = nl.ndarray(
+                            (compute_rows, 1),
+                            dtype=nl.float32,
+                            buffer=nl.sbuf,
+                        )
+                        nisa.activation(
+                            dst=probabilities,
+                            op=nl.exp,
+                            data=scores,
+                            bias=nl.negative(new_max),
+                            reduce_op=nl.add,
+                            reduce_res=tile_sum,
+                            reduce_cmd=nisa.reduce_cmd.reset_reduce,
+                        )
 
-                            scores = nl.where(
-                                block_valid_mask,
-                                nl.copy(score_psum, dtype=nl.float32),
-                                invalid_scores,
-                                dtype=nl.float32,
-                            )
-                            tile_max = nl.max(scores, axis=1, keepdims=True)
-                            new_max = nl.maximum(head_max, tile_max)
-                            alpha = nl.exp(nl.subtract(head_max, new_max))
-                            probabilities = nl.ndarray(
-                                (compute_rows, 128),
-                                dtype=nl.float32,
-                                buffer=nl.sbuf,
-                            )
-                            tile_sum = nl.ndarray(
-                                (compute_rows, 1),
-                                dtype=nl.float32,
-                                buffer=nl.sbuf,
-                            )
-                            nisa.activation(
-                                dst=probabilities,
-                                op=nl.exp,
-                                data=scores,
-                                bias=nl.negative(new_max),
-                                reduce_op=nl.add,
-                                reduce_res=tile_sum,
-                                reduce_cmd=nisa.reduce_cmd.reset_reduce,
-                            )
-
-                            probabilities_bf16 = nl.copy(
-                                probabilities, dtype=nl.bfloat16
-                            )
-                            probabilities_t = nl.ndarray(
-                                (128, compute_rows),
-                                dtype=nl.bfloat16,
-                                buffer=nl.sbuf,
-                            )
+                        probabilities_bf16 = nl.copy(
+                            probabilities, dtype=nl.bfloat16
+                        )
+                        probabilities_t = nl.ndarray(
+                            (128, kv_tiles, compute_rows),
+                            dtype=nl.bfloat16,
+                            buffer=nl.sbuf,
+                        )
+                        for kv_tile in nl.static_range(kv_tiles):
+                            kv_start = kv_tile * 128
+                            kv_end = kv_start + 128
                             probabilities_t_psum = nl.ndarray(
                                 (128, compute_rows),
                                 dtype=nl.bfloat16,
@@ -468,60 +480,68 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             )
                             nisa.nc_transpose(
                                 dst=probabilities_t_psum,
-                                data=probabilities_bf16,
+                                data=probabilities_bf16.slice(
+                                    1, kv_start, kv_end
+                                ),
                                 engine=nisa.engine.tensor,
                             )
                             nisa.tensor_copy(
-                                dst=probabilities_t,
+                                dst=probabilities_t.select(1, kv_tile),
                                 src=probabilities_t_psum,
                             )
 
-                            for d_tile in nl.static_range(d_tiles):
-                                pv_psum = nl.zeros(
-                                    (128, compute_rows),
-                                    dtype=nl.float32,
-                                    buffer=nl.psum,
-                                )
+                        for d_tile in nl.static_range(d_tiles):
+                            pv_psum = nl.ndarray(
+                                (128, compute_rows),
+                                dtype=nl.float32,
+                                buffer=nl.psum,
+                            )
+                            for kv_tile in nl.static_range(kv_tiles):
                                 nisa.nc_matmul(
                                     dst=pv_psum,
-                                    stationary=resident_v.select(1, d_tile),
-                                    moving=probabilities_t,
+                                    stationary=resident_v.select(
+                                        1, kv_tile
+                                    ).select(1, d_tile),
+                                    moving=probabilities_t.select(
+                                        1, kv_tile
+                                    ),
+                                    accumulate=kv_tile != 0,
                                 )
-                                pv_dq = nl.ndarray(
-                                    (128, compute_rows),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.sbuf,
-                                )
-                                nisa.tensor_copy(dst=pv_dq, src=pv_psum)
-                                pv_qd = nl.ndarray(
-                                    (compute_rows, 128),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.sbuf,
-                                )
-                                pv_qd_psum = nl.ndarray(
-                                    (compute_rows, 128),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.psum,
-                                )
-                                nisa.nc_transpose(
-                                    dst=pv_qd_psum,
-                                    data=pv_dq,
-                                    engine=nisa.engine.tensor,
-                                )
-                                nisa.tensor_copy(dst=pv_qd, src=pv_qd_psum)
-                                out_state = head_out.select(1, d_tile)
-                                out_state[:, :] = nl.add(
-                                    nl.multiply(out_state, alpha),
-                                    pv_qd,
-                                )
+                            pv_dq = nl.ndarray(
+                                (128, compute_rows),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            nisa.tensor_copy(dst=pv_dq, src=pv_psum)
+                            pv_qd = nl.ndarray(
+                                (compute_rows, 128),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            pv_qd_psum = nl.ndarray(
+                                (compute_rows, 128),
+                                dtype=nl.bfloat16,
+                                buffer=nl.psum,
+                            )
+                            nisa.nc_transpose(
+                                dst=pv_qd_psum,
+                                data=pv_dq,
+                                engine=nisa.engine.tensor,
+                            )
+                            nisa.tensor_copy(dst=pv_qd, src=pv_qd_psum)
+                            out_state = head_out.select(1, d_tile)
+                            out_state[:, :] = nl.add(
+                                nl.multiply(out_state, alpha),
+                                pv_qd,
+                            )
 
-                            head_sum[:, :] = nl.add(
-                                nl.multiply(head_sum, alpha),
-                                tile_sum,
-                            )
-                            head_max[:, :] = nl.copy(
-                                new_max, dtype=nl.float32
-                            )
+                        head_sum[:, :] = nl.add(
+                            nl.multiply(head_sum, alpha),
+                            tile_sum,
+                        )
+                        head_max[:, :] = nl.copy(
+                            new_max, dtype=nl.float32
+                        )
 
                 if pcp_size > 1 and has_next_ring_step:
                     nisa.core_barrier(data=incoming, cores=(0, 1))
