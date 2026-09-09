@@ -1,8 +1,10 @@
 """NKI implementation of history-only PCP attention.
 
-The code is deliberately direct.  It keeps Q and online-softmax state in SBUF,
-uses shared-HBM ping/pong communication buffers, and processes one 128-token
-KV tile at a time.  Optimized layouts and scheduling are future work.
+Q and online-softmax state stay resident in SBUF while shared-HBM ping/pong
+buffers circulate FP8 KV blocks. Q heads sharing one KV head are packed into a
+128-row compute tile, and every 512-token cache block is fused into one online
+softmax update. Each resident KV block is reused across all local Q chunks,
+and PV operand ordering produces the final Q-by-D orientation directly.
 """
 
 from __future__ import annotations
@@ -30,13 +32,18 @@ def pack_local_kv(k: Any, v: Any) -> Any:
 def make_history_attention_kernel(config: PCPAttentionConfig):
     """Build a JIT kernel specialized for every field except actual length.
 
-    ``block_valid_mask_ref`` is generated at runtime from actual history
-    length.  The current compiler rejects collectives inside device-side
+    ``block_valid_mask_ref`` contains an additive score bias generated at
+    runtime from the actual history length.  The current compiler rejects
+    collectives inside device-side
     dynamic loops, so the first hardware version executes the maximum static
     block count and masks blocks beyond the runtime length.
     """
 
     config.validate()
+    if config.block_size > 512:
+        raise ValueError(
+            "fused NKI kernel requires block_size <= TensorE moving fmax (512)"
+        )
     if config.num_kv_heads != config.lnc:
         raise ValueError(
             "first NKI kernel requires one KV head per LNC core "
@@ -120,8 +127,8 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         )
 
         # Collective endpoints use the historical KV storage dtype. This keeps
-        # FP8 caches compressed while they circulate through the HBM ring;
-        # individual tiles are converted to BF16 only when loaded into SBUF.
+        # FP8 caches compressed while they circulate through the HBM ring and,
+        # on the owner-transpose path, while TensorE consumes resident tiles.
         out_ref = nl.ndarray(q_ref.shape, dtype=q_ref.dtype, buffer=nl.shared_hbm)
         comm0 = nl.ndarray(
             (2, num_kv_heads, block_size, head_dim),
@@ -189,16 +196,16 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         )
         running_out = nl.ndarray(
             (compute_rows, q_tiles, head_groups, d_tiles, 128),
-            # The output numerator is consumed by BF16 TensorE matmuls and
-            # eventually returned as BF16. Keeping only max/sum in FP32 cuts
-            # the dominant recurrent vector-state traffic in half.
+            # The output numerator is eventually returned as BF16. Keeping
+            # only max/sum in FP32 cuts the dominant recurrent vector-state
+            # traffic in half.
             dtype=nl.bfloat16,
             buffer=nl.sbuf,
             name="online_numerator",
         )
         # neuronx-cc 2.27 rejects collective instructions inside a hardware
         # dynamic loop.  Iterate over the compiled maximum and use a runtime
-        # score mask so one artifact still supports shorter actual histories.
+        # score bias so one artifact still supports shorter actual histories.
         for block_index in nl.static_range(max_local_blocks):
             local_block = local_kv_ref.select(0, block_index).reshape(
                 (2, num_kv_heads, block_size, head_dim)
