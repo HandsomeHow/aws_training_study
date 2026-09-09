@@ -300,25 +300,87 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                     )
 
                 # One KV head is assigned to each LNC core. Load every K/V
-                # tile once and reuse it across all Q heads mapped to that KV
-                # head, instead of issuing the same HBM reads 16 times.
+                # tile once per ring step and reuse it across every Q chunk
+                # and Q head mapped to that KV head.
                 kv_head = core
+                resident_k = nl.ndarray(
+                    (128, d_tiles, block_size),
+                    dtype=resident_kv_dtype,
+                    buffer=nl.sbuf,
+                )
+                resident_v = nl.ndarray(
+                    (128, kv_tiles, d_tiles, 128),
+                    dtype=resident_kv_dtype,
+                    buffer=nl.sbuf,
+                )
+                for kv_tile in nl.static_range(kv_tiles):
+                    kv_start = kv_tile * 128
+                    kv_end = kv_start + 128
+                    for d_tile in nl.static_range(d_tiles):
+                        current_k = current.select(0, 0).select(
+                            0, kv_head
+                        ).slice(
+                            0, kv_start, kv_end
+                        ).slice(
+                            1, d_tile * 128, (d_tile + 1) * 128
+                        )
+                        k_tile = resident_k.select(1, d_tile).slice(
+                            1, kv_start, kv_end
+                        )
+                        if pretranspose_k_on_owner:
+                            k_tile[:, :] = nl.load(
+                                current_k,
+                                dtype=resident_kv_dtype,
+                            )
+                        elif local_kv_ref.dtype == nl.bfloat16:
+                            k_tile[:, :] = nl.load_transpose2d(
+                                current_k,
+                                dtype=nl.bfloat16,
+                            )
+                        else:
+                            k_tile_untransposed = nl.ndarray(
+                                (128, 128),
+                                dtype=nl.bfloat16,
+                                buffer=nl.sbuf,
+                            )
+                            k_tile_transposed_psum = nl.ndarray(
+                                (128, 128),
+                                dtype=nl.bfloat16,
+                                buffer=nl.psum,
+                            )
+                            k_tile_untransposed[:, :] = nl.load(
+                                current_k,
+                                dtype=nl.bfloat16,
+                            )
+                            nisa.nc_transpose(
+                                dst=k_tile_transposed_psum,
+                                data=k_tile_untransposed,
+                                engine=nisa.engine.tensor,
+                            )
+                            nisa.tensor_copy(
+                                dst=k_tile,
+                                src=k_tile_transposed_psum,
+                            )
+
+                        current_v = current.select(0, 1).select(
+                            0, kv_head
+                        ).slice(
+                            0, kv_start, kv_end
+                        ).slice(
+                            1, d_tile * 128, (d_tile + 1) * 128
+                        )
+                        resident_v.select(1, kv_tile).select(
+                            1, d_tile
+                        )[:, :] = nl.load(
+                            current_v, dtype=resident_kv_dtype
+                        )
+
                 for q_chunk in nl.static_range(q_tiles):
                     q_start = q_chunk * q_tile_size
                     q_end = q_start + q_tile_size
                     block_valid_mask = nl.ndarray(
                         (compute_rows, block_size),
                         dtype=nl.bfloat16,
-                        buffer=nl.sbuf,
-                    )
-                    resident_k = nl.ndarray(
-                        (128, d_tiles, block_size),
-                        dtype=resident_kv_dtype,
-                        buffer=nl.sbuf,
-                    )
-                    resident_v = nl.ndarray(
-                        (128, kv_tiles, d_tiles, 128),
-                        dtype=resident_kv_dtype,
                         buffer=nl.sbuf,
                     )
                     for kv_tile in nl.static_range(kv_tiles):
@@ -340,64 +402,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             ).slice(1, kv_start, kv_end)[:, :] = nl.copy(
                                 base_block_valid_mask,
                                 dtype=nl.bfloat16,
-                            )
-                        for d_tile in nl.static_range(d_tiles):
-                            current_k = current.select(0, 0).select(
-                                0, kv_head
-                            ).slice(
-                                0, kv_tile * 128, (kv_tile + 1) * 128
-                            ).slice(
-                                1, d_tile * 128, (d_tile + 1) * 128
-                            )
-                            k_tile = resident_k.select(1, d_tile).slice(
-                                1, kv_start, kv_end
-                            )
-                            if pretranspose_k_on_owner:
-                                k_tile[:, :] = nl.load(
-                                    current_k,
-                                    dtype=resident_kv_dtype,
-                                )
-                            elif local_kv_ref.dtype == nl.bfloat16:
-                                k_tile[:, :] = nl.load_transpose2d(
-                                    current_k,
-                                    dtype=nl.bfloat16,
-                                )
-                            else:
-                                k_tile_untransposed = nl.ndarray(
-                                    (128, 128),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.sbuf,
-                                )
-                                k_tile_transposed_psum = nl.ndarray(
-                                    (128, 128),
-                                    dtype=nl.bfloat16,
-                                    buffer=nl.psum,
-                                )
-                                k_tile_untransposed[:, :] = nl.load(
-                                    current_k,
-                                    dtype=nl.bfloat16,
-                                )
-                                nisa.nc_transpose(
-                                    dst=k_tile_transposed_psum,
-                                    data=k_tile_untransposed,
-                                    engine=nisa.engine.tensor,
-                                )
-                                nisa.tensor_copy(
-                                    dst=k_tile,
-                                    src=k_tile_transposed_psum,
-                                )
-
-                            current_v = current.select(0, 1).select(
-                                0, kv_head
-                            ).slice(
-                                0, kv_tile * 128, (kv_tile + 1) * 128
-                            ).slice(
-                                1, d_tile * 128, (d_tile + 1) * 128
-                            )
-                            resident_v.select(1, kv_tile).select(
-                                1, d_tile
-                            )[:, :] = nl.load(
-                                current_v, dtype=resident_kv_dtype
                             )
 
                     # Fuse all four 128-token KV tiles in the cache block into
