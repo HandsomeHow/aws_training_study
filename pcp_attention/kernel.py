@@ -168,20 +168,21 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             softmax_scale,
                         )
 
-        running_max = nl.full(
+        # Every state tile is initialized explicitly by the first history
+        # block, so avoid zero/-inf memsets over the full resident state.
+        running_max = nl.ndarray(
             (compute_rows, q_tiles, head_groups, 1),
-            fill_value=-9984.0,
             dtype=nl.float32,
             buffer=nl.sbuf,
             name="online_max",
         )
-        running_sum = nl.zeros(
+        running_sum = nl.ndarray(
             (compute_rows, q_tiles, head_groups, 1),
             dtype=nl.float32,
             buffer=nl.sbuf,
             name="online_sum",
         )
-        running_out = nl.zeros(
+        running_out = nl.ndarray(
             (compute_rows, q_tiles, head_groups, d_tiles, 128),
             # The output numerator is consumed by BF16 TensorE matmuls and
             # eventually returned as BF16. Keeping only max/sum in FP32 cuts
@@ -440,8 +441,16 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             dtype=nl.float32,
                         )
                         tile_max = nl.max(scores, axis=1, keepdims=True)
-                        new_max = nl.maximum(head_max, tile_max)
-                        alpha = nl.exp(nl.subtract(head_max, new_max))
+                        is_first_history_tile = (
+                            block_index == 0 and ring_step == 0
+                        )
+                        if is_first_history_tile:
+                            new_max = tile_max
+                        else:
+                            new_max = nl.maximum(head_max, tile_max)
+                            alpha = nl.exp(
+                                nl.subtract(head_max, new_max)
+                            )
                         probabilities = nl.ndarray(
                             (compute_rows, block_size),
                             dtype=nl.float32,
@@ -530,15 +539,25 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             )
                             nisa.tensor_copy(dst=pv_qd, src=pv_qd_psum)
                             out_state = head_out.select(1, d_tile)
-                            out_state[:, :] = nl.add(
-                                nl.multiply(out_state, alpha),
-                                pv_qd,
-                            )
+                            if is_first_history_tile:
+                                out_state[:, :] = nl.copy(
+                                    pv_qd, dtype=nl.bfloat16
+                                )
+                            else:
+                                out_state[:, :] = nl.add(
+                                    nl.multiply(out_state, alpha),
+                                    pv_qd,
+                                )
 
-                        head_sum[:, :] = nl.add(
-                            nl.multiply(head_sum, alpha),
-                            tile_sum,
-                        )
+                        if is_first_history_tile:
+                            head_sum[:, :] = nl.copy(
+                                tile_sum, dtype=nl.float32
+                            )
+                        else:
+                            head_sum[:, :] = nl.add(
+                                nl.multiply(head_sum, alpha),
+                                tile_sum,
+                            )
                         head_max[:, :] = nl.copy(
                             new_max, dtype=nl.float32
                         )
