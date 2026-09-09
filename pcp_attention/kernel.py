@@ -113,6 +113,11 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
             128,
         )
         replica_group = ncc.ReplicaGroup(replica_group_spec)
+        resident_kv_dtype = (
+            local_kv_ref.dtype
+            if pretranspose_k_on_owner
+            else nl.bfloat16
+        )
 
         # Collective endpoints use the historical KV storage dtype. This keeps
         # FP8 caches compressed while they circulate through the HBM ring;
@@ -308,12 +313,12 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                     )
                     resident_k = nl.ndarray(
                         (128, d_tiles, block_size),
-                        dtype=nl.bfloat16,
+                        dtype=resident_kv_dtype,
                         buffer=nl.sbuf,
                     )
                     resident_v = nl.ndarray(
                         (128, kv_tiles, d_tiles, 128),
-                        dtype=nl.bfloat16,
+                        dtype=resident_kv_dtype,
                         buffer=nl.sbuf,
                     )
                     for kv_tile in nl.static_range(kv_tiles):
@@ -350,7 +355,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             if pretranspose_k_on_owner:
                                 k_tile[:, :] = nl.load(
                                     current_k,
-                                    dtype=nl.bfloat16,
+                                    dtype=resident_kv_dtype,
                                 )
                             elif local_kv_ref.dtype == nl.bfloat16:
                                 k_tile[:, :] = nl.load_transpose2d(
@@ -392,7 +397,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             resident_v.select(1, kv_tile).select(
                                 1, d_tile
                             )[:, :] = nl.load(
-                                current_v, dtype=nl.bfloat16
+                                current_v, dtype=resident_kv_dtype
                             )
 
                     # Fuse all four 128-token KV tiles in the cache block into
