@@ -183,7 +183,10 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         )
         running_out = nl.zeros(
             (compute_rows, q_tiles, head_groups, d_tiles, 128),
-            dtype=nl.float32,
+            # The output numerator is consumed by BF16 TensorE matmuls and
+            # eventually returned as BF16. Keeping only max/sum in FP32 cuts
+            # the dominant recurrent vector-state traffic in half.
+            dtype=nl.bfloat16,
             buffer=nl.sbuf,
             name="online_numerator",
         )
@@ -473,18 +476,18 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 )
                                 pv_dq = nl.ndarray(
                                     (128, compute_rows),
-                                    dtype=nl.float32,
+                                    dtype=nl.bfloat16,
                                     buffer=nl.sbuf,
                                 )
                                 nisa.tensor_copy(dst=pv_dq, src=pv_psum)
                                 pv_qd = nl.ndarray(
                                     (compute_rows, 128),
-                                    dtype=nl.float32,
+                                    dtype=nl.bfloat16,
                                     buffer=nl.sbuf,
                                 )
                                 pv_qd_psum = nl.ndarray(
                                     (compute_rows, 128),
-                                    dtype=nl.float32,
+                                    dtype=nl.bfloat16,
                                     buffer=nl.psum,
                                 )
                                 nisa.nc_transpose(
