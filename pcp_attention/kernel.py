@@ -109,7 +109,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         assert tuple(block_valid_mask_ref.shape) == (
             max_local_blocks,
             kv_tiles,
-            q_len,
+            1,
             128,
         )
         replica_group = ncc.ReplicaGroup(replica_group_spec)
@@ -375,34 +375,29 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             current_v, dtype=resident_kv_dtype
                         )
 
-                for q_chunk in nl.static_range(q_tiles):
-                    q_start = q_chunk * q_tile_size
-                    q_end = q_start + q_tile_size
-                    block_valid_mask = nl.ndarray(
-                        (compute_rows, block_size),
+                block_valid_mask = nl.ndarray(
+                    (compute_rows, block_size),
+                    dtype=nl.bfloat16,
+                    buffer=nl.sbuf,
+                )
+                for kv_tile in nl.static_range(kv_tiles):
+                    kv_start = kv_tile * 128
+                    kv_end = kv_start + 128
+                    base_block_valid_mask = nl.load(
+                        block_valid_mask_ref.select(
+                            0, block_index
+                        ).select(0, kv_tile),
                         dtype=nl.bfloat16,
-                        buffer=nl.sbuf,
                     )
-                    for kv_tile in nl.static_range(kv_tiles):
-                        kv_start = kv_tile * 128
-                        kv_end = kv_start + 128
-                        base_block_valid_mask = nl.load(
-                            block_valid_mask_ref.select(
-                                0, block_index
-                            ).select(0, kv_tile).slice(0, q_start, q_end),
-                            dtype=nl.bfloat16,
-                        )
-                        for group_head in nl.static_range(
-                            heads_per_compute_tile
-                        ):
-                            row_start = group_head * q_tile_size
-                            row_end = row_start + q_tile_size
-                            block_valid_mask.slice(
-                                0, row_start, row_end
-                            ).slice(1, kv_start, kv_end)[:, :] = nl.copy(
-                                base_block_valid_mask,
-                                dtype=nl.bfloat16,
-                            )
+                    block_valid_mask.slice(
+                        1, kv_start, kv_end
+                    )[:, :] = nl.broadcast_to(
+                        base_block_valid_mask,
+                        (compute_rows, 128),
+                        dtype=nl.bfloat16,
+                    )
+
+                for q_chunk in nl.static_range(q_tiles):
 
                     # Fuse all four 128-token KV tiles in the cache block into
                     # one 512-column QK/softmax. This updates online state once
