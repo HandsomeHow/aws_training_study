@@ -275,7 +275,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                 # the full attention body once per head (16x for Qwen) while
                 # respecting the compiler restriction that forbids a
                 # collective *inside* a dynamic loop.
-                def compute_head(local_head):
+                for local_head in nl.static_range(heads_per_core):
                     # Contiguous head assignment means each physical core uses
                     # its one corresponding Qwen KV head.  Keeping this static
                     # avoids unsupported integer division of a device-loop
@@ -528,8 +528,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 head_out.select(1, state_d_tile),
                                 dtype=nl.float32,
                             )
-
-                nl.fori_loop(0, heads_per_core, compute_head)
 
                 if pcp_size > 1:
                     nisa.core_barrier(data=incoming, cores=(0, 1))
