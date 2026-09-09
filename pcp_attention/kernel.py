@@ -60,6 +60,13 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
     lnc = config.lnc
     max_local_blocks = config.max_local_blocks
     heads_per_core = num_q_heads // lnc
+    heads_per_compute_tile = min(heads_per_core, 128 // q_tile_size)
+    if heads_per_core % heads_per_compute_tile:
+        raise ValueError(
+            "heads_per_core must divide evenly into 128-row compute tiles"
+        )
+    head_groups = heads_per_core // heads_per_compute_tile
+    compute_rows = q_tile_size * heads_per_compute_tile
     kv_heads_per_core = num_kv_heads // lnc
     q_per_kv = num_q_heads // num_kv_heads
     d_tiles = head_dim // 128
@@ -85,6 +92,9 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         lnc=lnc,
         max_local_blocks=max_local_blocks,
         heads_per_core=heads_per_core,
+        heads_per_compute_tile=heads_per_compute_tile,
+        head_groups=head_groups,
+        compute_rows=compute_rows,
         kv_heads_per_core=kv_heads_per_core,
         q_per_kv=q_per_kv,
         d_tiles=d_tiles,
@@ -125,47 +135,60 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         # Q is loaded once, scaled once, and remains live in SBUF for the full
         # outer loop.  Each LNC core owns a disjoint group of heads.
         q_local = nl.ndarray(
-            (128, heads_per_core, d_tiles, q_len),
+            (128, q_tiles, head_groups, d_tiles, compute_rows),
             dtype=nl.bfloat16,
             buffer=nl.sbuf,
             name="resident_q",
         )
-        for local_head in nl.static_range(heads_per_core):
-            global_head = core * heads_per_core + local_head
-            for d_tile in nl.static_range(d_tiles):
-                q_input = q_ref.select(0, global_head).slice(
-                    1, d_tile * 128, (d_tile + 1) * 128
-                )
-                q_tile = q_local.select(1, local_head).select(1, d_tile)
-                q_tile[:, :] = nl.multiply(
-                    nl.load_transpose2d(
-                        q_input,
-                        dtype=nl.bfloat16,
-                    ),
-                    softmax_scale,
-                )
+        for head_group in nl.static_range(head_groups):
+            for group_head in nl.static_range(heads_per_compute_tile):
+                local_head = head_group * heads_per_compute_tile + group_head
+                global_head = core * heads_per_core + local_head
+                row_start = group_head * q_tile_size
+                row_end = row_start + q_tile_size
+                for q_chunk in nl.static_range(q_tiles):
+                    q_start = q_chunk * q_tile_size
+                    q_end = q_start + q_tile_size
+                    for d_tile in nl.static_range(d_tiles):
+                        q_input = q_ref.select(0, global_head).slice(
+                            0, q_start, q_end
+                        ).slice(
+                            1, d_tile * 128, (d_tile + 1) * 128
+                        )
+                        q_tile = q_local.select(1, q_chunk).select(
+                            1, head_group
+                        ).select(1, d_tile).slice(
+                            1, row_start, row_end
+                        )
+                        q_tile[:, :] = nl.multiply(
+                            nl.load_transpose2d(
+                                q_input,
+                                dtype=nl.bfloat16,
+                            ),
+                            softmax_scale,
+                        )
 
         running_max = nl.full(
-            (q_tile_size, q_tiles, heads_per_core, 1),
+            (compute_rows, q_tiles, head_groups, 1),
             fill_value=-9984.0,
             dtype=nl.float32,
             buffer=nl.sbuf,
             name="online_max",
         )
         running_sum = nl.zeros(
-            (q_tile_size, q_tiles, heads_per_core, 1),
+            (compute_rows, q_tiles, head_groups, 1),
             dtype=nl.float32,
             buffer=nl.sbuf,
             name="online_sum",
         )
         running_out = nl.zeros(
-            (q_tile_size, q_tiles, heads_per_core, d_tiles, 128),
+            (compute_rows, q_tiles, head_groups, d_tiles, 128),
             dtype=nl.float32,
             buffer=nl.sbuf,
             name="online_numerator",
         )
         invalid_scores = nl.full(
-            (q_tile_size, 128),
+            (compute_rows, 128),
             fill_value=-9984.0,
             dtype=nl.float32,
             buffer=nl.sbuf,
@@ -278,12 +301,28 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                     q_start = q_chunk * q_tile_size
                     q_end = q_start + q_tile_size
                     for kv_tile in nl.static_range(kv_tiles):
-                        block_valid_mask = nl.load(
+                        base_block_valid_mask = nl.load(
                             block_valid_mask_ref.select(
                                 0, block_index
                             ).select(0, kv_tile).slice(0, q_start, q_end),
                             dtype=nl.uint8,
                         )
+                        block_valid_mask = nl.ndarray(
+                            (compute_rows, 128),
+                            dtype=nl.uint8,
+                            buffer=nl.sbuf,
+                        )
+                        for group_head in nl.static_range(
+                            heads_per_compute_tile
+                        ):
+                            row_start = group_head * q_tile_size
+                            row_end = row_start + q_tile_size
+                            block_valid_mask.slice(
+                                0, row_start, row_end
+                            )[:, :] = nl.copy(
+                                base_block_valid_mask,
+                                dtype=nl.uint8,
+                            )
                         resident_k = nl.ndarray(
                             (128, d_tiles, 128),
                             dtype=nl.bfloat16,
@@ -350,22 +389,22 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 dtype=nl.bfloat16,
                             )
 
-                        for local_head in nl.static_range(heads_per_core):
+                        for head_group in nl.static_range(head_groups):
                             head_max = running_max.select(
                                 1, q_chunk
-                            ).select(1, local_head)
+                            ).select(1, head_group)
                             head_sum = running_sum.select(
                                 1, q_chunk
-                            ).select(1, local_head)
+                            ).select(1, head_group)
                             head_out = running_out.select(
                                 1, q_chunk
-                            ).select(1, local_head)
-                            head_q = q_local.select(1, local_head).slice(
-                                2, q_start, q_end
+                            ).select(1, head_group)
+                            head_q = q_local.select(1, q_chunk).select(
+                                1, head_group
                             )
 
                             score_psum = nl.zeros(
-                                (q_tile_size, 128),
+                                (compute_rows, 128),
                                 dtype=nl.float32,
                                 buffer=nl.psum,
                             )
@@ -397,12 +436,12 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 probabilities, dtype=nl.bfloat16
                             )
                             probabilities_t = nl.ndarray(
-                                (128, q_tile_size),
+                                (128, compute_rows),
                                 dtype=nl.bfloat16,
                                 buffer=nl.sbuf,
                             )
                             probabilities_t_psum = nl.ndarray(
-                                (128, q_tile_size),
+                                (128, compute_rows),
                                 dtype=nl.bfloat16,
                                 buffer=nl.psum,
                             )
@@ -418,7 +457,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
 
                             for d_tile in nl.static_range(d_tiles):
                                 pv_psum = nl.zeros(
-                                    (128, q_tile_size),
+                                    (128, compute_rows),
                                     dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
@@ -428,18 +467,18 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                     moving=probabilities_t,
                                 )
                                 pv_dq = nl.ndarray(
-                                    (128, q_tile_size),
+                                    (128, compute_rows),
                                     dtype=nl.float32,
                                     buffer=nl.sbuf,
                                 )
                                 nisa.tensor_copy(dst=pv_dq, src=pv_psum)
                                 pv_qd = nl.ndarray(
-                                    (q_tile_size, 128),
+                                    (compute_rows, 128),
                                     dtype=nl.float32,
                                     buffer=nl.sbuf,
                                 )
                                 pv_qd_psum = nl.ndarray(
-                                    (q_tile_size, 128),
+                                    (compute_rows, 128),
                                     dtype=nl.float32,
                                     buffer=nl.psum,
                                 )
@@ -466,30 +505,43 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                 if pcp_size > 1:
                     nisa.core_barrier(data=incoming, cores=(0, 1))
 
-        for local_head in nl.static_range(heads_per_core):
-            global_head = core * heads_per_core + local_head
+        for head_group in nl.static_range(head_groups):
             for q_chunk in nl.static_range(q_tiles):
                 q_start = q_chunk * q_tile_size
                 q_end = q_start + q_tile_size
                 sum_state = running_sum.select(1, q_chunk).select(
-                    1, local_head
+                    1, head_group
                 )
                 inverse_sum = nl.ndarray(
-                    (q_tile_size, 1), dtype=nl.float32, buffer=nl.sbuf
+                    (compute_rows, 1), dtype=nl.float32, buffer=nl.sbuf
                 )
                 nisa.reciprocal(dst=inverse_sum, data=sum_state)
                 for d_tile in nl.static_range(d_tiles):
                     out_state = running_out.select(1, q_chunk).select(
-                        1, local_head
+                        1, head_group
                     ).select(1, d_tile)
                     normalized = nl.multiply(out_state, inverse_sum)
-                    output_tile = out_ref.select(0, global_head).slice(
-                        0, q_start, q_end
-                    ).slice(1, d_tile * 128, (d_tile + 1) * 128)
-                    nl.store(
-                        output_tile,
-                        value=nl.copy(normalized, dtype=q_ref.dtype),
-                    )
+                    for group_head in nl.static_range(
+                        heads_per_compute_tile
+                    ):
+                        local_head = (
+                            head_group * heads_per_compute_tile + group_head
+                        )
+                        global_head = core * heads_per_core + local_head
+                        row_start = group_head * q_tile_size
+                        row_end = row_start + q_tile_size
+                        output_tile = out_ref.select(
+                            0, global_head
+                        ).slice(0, q_start, q_end).slice(
+                            1, d_tile * 128, (d_tile + 1) * 128
+                        )
+                        nl.store(
+                            output_tile,
+                            value=nl.copy(
+                                normalized.slice(0, row_start, row_end),
+                                dtype=q_ref.dtype,
+                            ),
+                        )
         nisa.core_barrier(data=out_ref, cores=(0, 1))
         return out_ref
 
