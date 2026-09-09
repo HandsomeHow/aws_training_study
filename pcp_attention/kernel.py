@@ -191,14 +191,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
             buffer=nl.sbuf,
             name="online_numerator",
         )
-        invalid_scores = nl.full(
-            (compute_rows, block_size),
-            fill_value=-9984.0,
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-            name="invalid_scores",
-        )
-
         # neuronx-cc 2.27 rejects collective instructions inside a hardware
         # dynamic loop.  Iterate over the compiled maximum and use a runtime
         # score mask so one artifact still supports shorter actual histories.
@@ -311,7 +303,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                     q_end = q_start + q_tile_size
                     block_valid_mask = nl.ndarray(
                         (compute_rows, block_size),
-                        dtype=nl.uint8,
+                        dtype=nl.bfloat16,
                         buffer=nl.sbuf,
                     )
                     resident_k = nl.ndarray(
@@ -331,7 +323,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             block_valid_mask_ref.select(
                                 0, block_index
                             ).select(0, kv_tile).slice(0, q_start, q_end),
-                            dtype=nl.uint8,
+                            dtype=nl.bfloat16,
                         )
                         for group_head in nl.static_range(
                             heads_per_compute_tile
@@ -342,7 +334,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 0, row_start, row_end
                             ).slice(1, kv_start, kv_end)[:, :] = nl.copy(
                                 base_block_valid_mask,
-                                dtype=nl.uint8,
+                                dtype=nl.bfloat16,
                             )
                         for d_tile in nl.static_range(d_tiles):
                             current_k = current.select(0, 0).select(
@@ -434,10 +426,9 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 accumulate=d_tile != 0,
                             )
 
-                        scores = nl.where(
-                            block_valid_mask,
+                        scores = nl.add(
                             nl.copy(score_psum, dtype=nl.float32),
-                            invalid_scores,
+                            block_valid_mask,
                             dtype=nl.float32,
                         )
                         tile_max = nl.max(scores, axis=1, keepdims=True)

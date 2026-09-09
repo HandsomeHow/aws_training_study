@@ -9,8 +9,9 @@ def test_partial_block_valid_mask() -> None:
     mask = make_block_valid_mask(cfg)
 
     assert mask.shape == (1, 4, cfg.local_q_len, 128)
-    assert torch.all(mask[0, :2] == 1)
-    assert torch.all(mask[0, 2:] == 0)
+    assert mask.dtype == torch.bfloat16
+    assert torch.all(mask[0, :2] == 0)
+    assert torch.all(mask[0, 2:] == -9984)
 
 
 def test_kv_storage_dtype() -> None:

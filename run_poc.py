@@ -160,19 +160,20 @@ def make_local_inputs(
 
 
 def make_block_valid_mask(cfg: PCPAttentionConfig) -> torch.Tensor:
-    """Return the per-key runtime mask for a potentially partial last block."""
+    """Return an additive score bias for a potentially partial last block."""
 
     kv_tiles = cfg.block_size // 128
-    mask = torch.zeros(
+    mask = torch.full(
         (cfg.max_local_blocks, kv_tiles, cfg.local_q_len, 128),
-        dtype=torch.uint8,
+        fill_value=-9984.0,
+        dtype=torch.bfloat16,
     )
     remaining = cfg.actual_local_history_len
     for block in range(cfg.actual_local_blocks):
         valid_in_block = min(cfg.block_size, remaining)
         for tile in range(kv_tiles):
             valid_in_tile = min(128, max(0, valid_in_block - tile * 128))
-            mask[block, tile, :, :valid_in_tile] = 1
+            mask[block, tile, :, :valid_in_tile] = 0
         remaining -= valid_in_block
     return mask
 
