@@ -426,10 +426,17 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                                 accumulate=d_tile != 0,
                             )
 
-                        scores = nl.add(
-                            nl.copy(score_psum, dtype=nl.float32),
-                            block_valid_mask,
+                        scores = nl.ndarray(
+                            (compute_rows, block_size),
                             dtype=nl.float32,
+                            buffer=nl.sbuf,
+                        )
+                        nisa.tensor_tensor(
+                            dst=scores,
+                            data1=score_psum,
+                            data2=block_valid_mask,
+                            op=nl.add,
+                            engine=nisa.engine.vector,
                         )
                         tile_max = nl.max(scores, axis=1, keepdims=True)
                         is_first_history_tile = (
@@ -444,7 +451,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             )
                         probabilities = nl.ndarray(
                             (compute_rows, block_size),
-                            dtype=nl.float32,
+                            dtype=nl.bfloat16,
                             buffer=nl.sbuf,
                         )
                         tile_sum = nl.ndarray(
@@ -462,9 +469,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             reduce_cmd=nisa.reduce_cmd.reset_reduce,
                         )
 
-                        probabilities_bf16 = nl.copy(
-                            probabilities, dtype=nl.bfloat16
-                        )
                         probabilities_t = nl.ndarray(
                             (128, kv_tiles, compute_rows),
                             dtype=nl.bfloat16,
@@ -480,7 +484,7 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             )
                             nisa.nc_transpose(
                                 dst=probabilities_t_psum,
-                                data=probabilities_bf16.slice(
+                                data=probabilities.slice(
                                     1, kv_start, kv_end
                                 ),
                                 engine=nisa.engine.tensor,
