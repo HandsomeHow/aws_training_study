@@ -505,43 +505,29 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
 
                         for d_tile in nl.static_range(d_tiles):
                             pv_psum = nl.ndarray(
-                                (128, compute_rows),
+                                (compute_rows, 128),
                                 dtype=nl.float32,
                                 buffer=nl.psum,
                             )
                             for kv_tile in nl.static_range(kv_tiles):
                                 nisa.nc_matmul(
                                     dst=pv_psum,
-                                    stationary=resident_v.select(
+                                    stationary=probabilities_t.select(
                                         1, kv_tile
-                                    ).select(1, d_tile),
-                                    moving=probabilities_t.select(
+                                    ),
+                                    moving=resident_v.select(
                                         1, kv_tile
+                                    ).select(
+                                        1, d_tile
                                     ),
                                     accumulate=kv_tile != 0,
                                 )
-                            pv_dq = nl.ndarray(
-                                (128, compute_rows),
-                                dtype=nl.bfloat16,
-                                buffer=nl.sbuf,
-                            )
-                            nisa.tensor_copy(dst=pv_dq, src=pv_psum)
                             pv_qd = nl.ndarray(
                                 (compute_rows, 128),
                                 dtype=nl.bfloat16,
                                 buffer=nl.sbuf,
                             )
-                            pv_qd_psum = nl.ndarray(
-                                (compute_rows, 128),
-                                dtype=nl.bfloat16,
-                                buffer=nl.psum,
-                            )
-                            nisa.nc_transpose(
-                                dst=pv_qd_psum,
-                                data=pv_dq,
-                                engine=nisa.engine.tensor,
-                            )
-                            nisa.tensor_copy(dst=pv_qd, src=pv_qd_psum)
+                            nisa.tensor_copy(dst=pv_qd, src=pv_psum)
                             out_state = head_out.select(1, d_tile)
                             if is_first_history_tile:
                                 out_state[:, :] = nl.copy(
