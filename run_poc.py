@@ -38,20 +38,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-q-heads", type=int)
     parser.add_argument("--num-kv-heads", type=int)
     parser.add_argument("--head-dim", type=int)
-    parser.add_argument(
-        "--kv-dtype",
-        choices=("bf16", "fp8_e4m3fn"),
-        default="bf16",
-        help="storage and ring-communication dtype for the historical K/V cache",
-    )
-    parser.add_argument(
-        "--pretranspose-k-on-owner",
-        action="store_true",
-        help=(
-            "transpose each K tile once on its owner rank before placing it "
-            "in the ring buffers"
-        ),
-    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--check", choices=("full", "sampled", "none"), default="full")
     parser.add_argument(
@@ -86,23 +72,13 @@ def make_config(args: argparse.Namespace) -> PCPAttentionConfig:
             "num_q_heads",
             "num_kv_heads",
             "head_dim",
-            "pretranspose_k_on_owner",
         )
         if getattr(args, name) is not None
-        and (name != "pretranspose_k_on_owner" or getattr(args, name))
     }
     return cfg.with_overrides(**overrides)
 
 
-def kv_storage_dtype(name: str) -> torch.dtype:
-    if name == "bf16":
-        return torch.bfloat16
-    if name == "fp8_e4m3fn":
-        return torch.float8_e4m3fn
-    raise ValueError(f"unsupported KV storage dtype: {name}")
-
-
-def make_inputs(cfg: PCPAttentionConfig, seed: int, kv_dtype: torch.dtype):
+def make_inputs(cfg: PCPAttentionConfig, seed: int):
     generator = torch.Generator().manual_seed(seed)
     q = torch.randn(
         cfg.num_q_heads,
@@ -117,14 +93,14 @@ def make_inputs(cfg: PCPAttentionConfig, seed: int, kv_dtype: torch.dtype):
         cfg.head_dim,
         generator=generator,
         dtype=torch.bfloat16,
-    ).to(kv_dtype)
+    ).to(torch.float8_e4m3fn)
     v = torch.randn(
         cfg.num_kv_heads,
         cfg.actual_history_len,
         cfg.head_dim,
         generator=generator,
         dtype=torch.bfloat16,
-    ).to(kv_dtype)
+    ).to(torch.float8_e4m3fn)
     return q, k, v
 
 
@@ -132,7 +108,6 @@ def make_local_inputs(
     cfg: PCPAttentionConfig,
     seed: int,
     rank: int,
-    kv_dtype: torch.dtype,
 ):
     """Generate only one rank's tensors for memory-safe full-size runs."""
 
@@ -151,10 +126,10 @@ def make_local_inputs(
         cfg.head_dim,
     )
     k = torch.randn(*cache_shape, generator=generator, dtype=torch.bfloat16).to(
-        kv_dtype
+        torch.float8_e4m3fn
     )
     v = torch.randn(*cache_shape, generator=generator, dtype=torch.bfloat16).to(
-        kv_dtype
+        torch.float8_e4m3fn
     )
     return q, k, v
 
@@ -178,8 +153,8 @@ def make_block_valid_mask(cfg: PCPAttentionConfig) -> torch.Tensor:
     return mask
 
 
-def run_cpu(cfg: PCPAttentionConfig, seed: int, kv_dtype_name: str) -> None:
-    q, k, v = make_inputs(cfg, seed, kv_storage_dtype(kv_dtype_name))
+def run_cpu(cfg: PCPAttentionConfig, seed: int) -> None:
+    q, k, v = make_inputs(cfg, seed)
     q_shards = shard_query(q, cfg)
     k_shards, v_shards = shard_history(k, v, cfg)
     output = ring_history_attention(q_shards, k_shards, v_shards, cfg)
@@ -198,7 +173,6 @@ def run_neuron(
     cfg: PCPAttentionConfig,
     seed: int,
     check: str,
-    kv_dtype_name: str,
     benchmark_iterations: int = 0,
     benchmark_warmups: int = 1,
 ) -> None:
@@ -241,18 +215,14 @@ def run_neuron(
     import libtorch_neuronx_lite  # noqa: F401
     from pcp_attention.kernel import pack_local_kv, wrap_for_native_torch
 
-    kv_dtype = kv_storage_dtype(kv_dtype_name)
-
     # Correctness runs construct the global tensors used by the dense host
     # oracle.  Unchecked full-machine runs create just the local shard so 64
     # processes do not each replicate the complete 128K cache in host memory.
     if check == "none":
-        q_local, k_local, v_local = make_local_inputs(
-            cfg, seed, rank, kv_dtype
-        )
+        q_local, k_local, v_local = make_local_inputs(cfg, seed, rank)
         k = v = None
     else:
-        q, k, v = make_inputs(cfg, seed, kv_dtype)
+        q, k, v = make_inputs(cfg, seed)
         q_shards = shard_query(q, cfg)
         k_shards, v_shards = shard_history(k, v, cfg)
         q_local = q_shards[rank]
@@ -343,7 +313,7 @@ def run_neuron(
             print(
                 "benchmark: "
                 "mode=synchronized_single_jit, "
-                f"kv_dtype={kv_dtype_name}, "
+                "kv_dtype=fp8_e4m3fn, "
                 f"iterations={benchmark_iterations}, "
                 f"warmups={benchmark_warmups}, "
                 f"min_ms={min(global_samples_ms):.3f}, "
@@ -368,17 +338,16 @@ def main() -> int:
             print(f"  {name}={value}")
         print(f"  local_q_len={cfg.local_q_len}")
         print(f"  actual_local_blocks={cfg.actual_local_blocks}")
-        print(f"  kv_dtype={args.kv_dtype}")
+        print("  kv_dtype=fp8_e4m3fn")
     if args.backend == "cpu":
         if args.benchmark_iterations:
             raise ValueError("benchmark mode currently requires --backend neuron")
-        run_cpu(cfg, args.seed, args.kv_dtype)
+        run_cpu(cfg, args.seed)
     else:
         run_neuron(
             cfg,
             args.seed,
             args.check,
-            args.kv_dtype,
             args.benchmark_iterations,
             args.benchmark_warmups,
         )

@@ -25,7 +25,6 @@ class PCPAttentionConfig:
     head_dim: int = 256
     lnc: int = 2
     alignment: int = 4096
-    pretranspose_k_on_owner: bool = False
 
     @property
     def softmax_scale(self) -> float:

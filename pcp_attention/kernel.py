@@ -81,8 +81,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
     payload_elements = 2 * num_kv_heads * block_size * head_dim
     replica_group_spec = (tuple(range(pcp_size)),)
     softmax_scale = config.softmax_scale
-    pretranspose_k_on_owner = config.pretranspose_k_on_owner
-
     @nki.jit
     def history_attention_kernel(
         q_ref,
@@ -109,7 +107,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
         payload_elements=payload_elements,
         replica_group_spec=replica_group_spec,
         softmax_scale=softmax_scale,
-        pretranspose_k_on_owner=pretranspose_k_on_owner,
     ):
         assert tuple(q_ref.shape) == (num_q_heads, q_len, head_dim)
         assert tuple(local_kv_ref.shape) == (max_local_blocks, payload_elements)
@@ -120,15 +117,10 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
             128,
         )
         replica_group = ncc.ReplicaGroup(replica_group_spec)
-        resident_kv_dtype = (
-            local_kv_ref.dtype
-            if pretranspose_k_on_owner
-            else nl.bfloat16
-        )
+        resident_kv_dtype = local_kv_ref.dtype
 
-        # Collective endpoints use the historical KV storage dtype. This keeps
-        # FP8 caches compressed while they circulate through the HBM ring and,
-        # on the owner-transpose path, while TensorE consumes resident tiles.
+        # Collective endpoints keep FP8 caches compressed while they circulate
+        # through the HBM ring and while TensorE consumes resident tiles.
         out_ref = nl.ndarray(q_ref.shape, dtype=q_ref.dtype, buffer=nl.shared_hbm)
         comm0 = nl.ndarray(
             (2, num_kv_heads, block_size, head_dim),
@@ -210,78 +202,72 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
             local_block = local_kv_ref.select(0, block_index).reshape(
                 (2, num_kv_heads, block_size, head_dim)
             )
-            if pretranspose_k_on_owner:
-                # Each LNC core owns one KV head. Transpose its local K tiles
-                # once before the first ring hop and preserve that physical
-                # FP8 layout through all subsequent collective permutations.
-                owner_k = local_block.select(0, 0).select(0, core)
-                ring_k = comm0.select(0, 0).select(0, core)
-                for owner_kv_tile in nl.static_range(kv_tiles):
-                    for owner_d_tile in nl.static_range(d_tiles):
-                        owner_k_tile = owner_k.slice(
-                            0,
-                            owner_kv_tile * 128,
-                            (owner_kv_tile + 1) * 128,
-                        ).slice(
-                            1,
-                            owner_d_tile * 128,
-                            (owner_d_tile + 1) * 128,
-                        )
-                        owner_k_sbuf = nl.ndarray(
-                            (128, 128),
-                            dtype=nl.bfloat16,
-                            buffer=nl.sbuf,
-                        )
-                        owner_k_t_psum = nl.ndarray(
-                            (128, 128),
-                            dtype=nl.bfloat16,
-                            buffer=nl.psum,
-                        )
-                        owner_k_t_sbuf = nl.ndarray(
-                            (128, 128),
-                            dtype=nl.bfloat16,
-                            buffer=nl.sbuf,
-                        )
-                        owner_k_sbuf[:, :] = nl.load(
-                            owner_k_tile,
-                            dtype=nl.bfloat16,
-                        )
-                        nisa.nc_transpose(
-                            dst=owner_k_t_psum,
-                            data=owner_k_sbuf,
-                            engine=nisa.engine.tensor,
-                        )
-                        nisa.tensor_copy(
-                            dst=owner_k_t_sbuf,
-                            src=owner_k_t_psum,
-                        )
-                        ring_k_tile = ring_k.slice(
-                            0,
-                            owner_kv_tile * 128,
-                            (owner_kv_tile + 1) * 128,
-                        ).slice(
-                            1,
-                            owner_d_tile * 128,
-                            (owner_d_tile + 1) * 128,
-                        )
-                        nl.store(
-                            ring_k_tile,
-                            value=nl.copy(
-                                owner_k_t_sbuf,
-                                dtype=local_kv_ref.dtype,
-                            ),
-                        )
+            # Each LNC core owns one KV head. Transpose its local K tiles once
+            # before the first ring hop and preserve that physical FP8 layout
+            # through all subsequent collective permutations.
+            owner_k = local_block.select(0, 0).select(0, core)
+            ring_k = comm0.select(0, 0).select(0, core)
+            for owner_kv_tile in nl.static_range(kv_tiles):
+                for owner_d_tile in nl.static_range(d_tiles):
+                    owner_k_tile = owner_k.slice(
+                        0,
+                        owner_kv_tile * 128,
+                        (owner_kv_tile + 1) * 128,
+                    ).slice(
+                        1,
+                        owner_d_tile * 128,
+                        (owner_d_tile + 1) * 128,
+                    )
+                    owner_k_sbuf = nl.ndarray(
+                        (128, 128),
+                        dtype=nl.bfloat16,
+                        buffer=nl.sbuf,
+                    )
+                    owner_k_t_psum = nl.ndarray(
+                        (128, 128),
+                        dtype=nl.bfloat16,
+                        buffer=nl.psum,
+                    )
+                    owner_k_t_sbuf = nl.ndarray(
+                        (128, 128),
+                        dtype=nl.bfloat16,
+                        buffer=nl.sbuf,
+                    )
+                    owner_k_sbuf[:, :] = nl.load(
+                        owner_k_tile,
+                        dtype=nl.bfloat16,
+                    )
+                    nisa.nc_transpose(
+                        dst=owner_k_t_psum,
+                        data=owner_k_sbuf,
+                        engine=nisa.engine.tensor,
+                    )
+                    nisa.tensor_copy(
+                        dst=owner_k_t_sbuf,
+                        src=owner_k_t_psum,
+                    )
+                    ring_k_tile = ring_k.slice(
+                        0,
+                        owner_kv_tile * 128,
+                        (owner_kv_tile + 1) * 128,
+                    ).slice(
+                        1,
+                        owner_d_tile * 128,
+                        (owner_d_tile + 1) * 128,
+                    )
+                    nl.store(
+                        ring_k_tile,
+                        value=nl.copy(
+                            owner_k_t_sbuf,
+                            dtype=local_kv_ref.dtype,
+                        ),
+                    )
 
-                # V is already in the orientation required by the PV matmul.
-                nisa.dma_copy(
-                    dst=comm0.select(0, 1).select(0, core),
-                    src=local_block.select(0, 1).select(0, core),
-                )
-            elif core == 0:
-                nisa.dma_copy(
-                    dst=comm0.reshape((1, payload_elements)),
-                    src=local_block.reshape((1, payload_elements)),
-                )
+            # V is already in the orientation required by the PV matmul.
+            nisa.dma_copy(
+                dst=comm0.select(0, 1).select(0, core),
+                src=local_block.select(0, 1).select(0, core),
+            )
             nisa.core_barrier(data=comm0, cores=(0, 1))
 
             # Static PCP size gives a fixed collective topology.  Collective
@@ -334,40 +320,10 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                         k_tile = resident_k.select(1, d_tile).slice(
                             1, kv_start, kv_end
                         )
-                        if pretranspose_k_on_owner:
-                            k_tile[:, :] = nl.load(
-                                current_k,
-                                dtype=resident_kv_dtype,
-                            )
-                        elif local_kv_ref.dtype == nl.bfloat16:
-                            k_tile[:, :] = nl.load_transpose2d(
-                                current_k,
-                                dtype=nl.bfloat16,
-                            )
-                        else:
-                            k_tile_untransposed = nl.ndarray(
-                                (128, 128),
-                                dtype=nl.bfloat16,
-                                buffer=nl.sbuf,
-                            )
-                            k_tile_transposed_psum = nl.ndarray(
-                                (128, 128),
-                                dtype=nl.bfloat16,
-                                buffer=nl.psum,
-                            )
-                            k_tile_untransposed[:, :] = nl.load(
-                                current_k,
-                                dtype=nl.bfloat16,
-                            )
-                            nisa.nc_transpose(
-                                dst=k_tile_transposed_psum,
-                                data=k_tile_untransposed,
-                                engine=nisa.engine.tensor,
-                            )
-                            nisa.tensor_copy(
-                                dst=k_tile,
-                                src=k_tile_transposed_psum,
-                            )
+                        k_tile[:, :] = nl.load(
+                            current_k,
+                            dtype=resident_kv_dtype,
+                        )
 
                         current_v = current.select(0, 1).select(
                             0, kv_head

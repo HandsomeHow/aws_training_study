@@ -175,7 +175,6 @@ Run the requested full-machine case with 20 measured calls:
 ```bash
 torchrun --standalone --nproc_per_node=64 run_poc.py \
   --backend neuron --preset full --pcp-size 64 --check none \
-  --kv-dtype fp8_e4m3fn --pretranspose-k-on-owner \
   --benchmark-iterations 30 --benchmark-warmups 3
 ```
 
@@ -250,8 +249,8 @@ the TensorE/vector pipeline effectively.
   `interleave_size`.
 - `current_len`, `actual_history_len`, and `max_history_len` must be divisible
   by `pcp_size * interleave_size` in the first hardware version.
-- Q is BF16. K/V storage may be BF16 or FP8; the optimized owner-transpose path
-  keeps FP8 K/V compressed through the ring and resident SBUF tiles.
+- Q is BF16. K/V storage is FP8 E4M3FN. Every owner transposes K once, then K/V
+  remain compressed through the ring and in resident SBUF tiles.
 - Online-softmax max/sum are FP32; probabilities and numerator state are BF16,
   with TensorE accumulation in FP32.
 - The CPU implementation is the executable specification.  The hardware path
