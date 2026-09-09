@@ -270,11 +270,9 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                         channel_ids=[0],
                     )
 
-                # Keep the collective in the statically-unrolled ring, but
-                # execute heads in a device-side loop.  This avoids cloning
-                # the full attention body once per head (16x for Qwen) while
-                # respecting the compiler restriction that forbids a
-                # collective *inside* a dynamic loop.
+                # Heads are static so all state selections below resolve to
+                # fixed SBUF addresses. This trades a larger artifact for
+                # avoiding dynamic-loop scheduling and state traffic.
                 for local_head in nl.static_range(heads_per_core):
                     # Contiguous head assignment means each physical core uses
                     # its one corresponding Qwen KV head.  Keeping this static
@@ -290,54 +288,21 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                         q_start = q_chunk * q_tile_size
                         q_end = q_start + q_tile_size
 
-                        # Materialize dynamically selected state into fixed-
-                        # shape SBUF tiles. Only entry/exit copies use the
-                        # dynamic head offset.
-                        head_max = nl.ndarray(
-                            (q_tile_size, 1),
-                            dtype=nl.float32,
-                            buffer=nl.sbuf,
+                        # Static views operate directly on resident Q and the
+                        # persistent online-softmax state. No staging copies
+                        # are needed at head entry or exit.
+                        head_max = running_max.select(1, q_chunk).select(
+                            1, local_head
                         )
-                        head_sum = nl.ndarray(
-                            (q_tile_size, 1),
-                            dtype=nl.float32,
-                            buffer=nl.sbuf,
+                        head_sum = running_sum.select(1, q_chunk).select(
+                            1, local_head
                         )
-                        head_out = nl.ndarray(
-                            (q_tile_size, d_tiles, 128),
-                            dtype=nl.float32,
-                            buffer=nl.sbuf,
+                        head_out = running_out.select(1, q_chunk).select(
+                            1, local_head
                         )
-                        head_q = nl.ndarray(
-                            (128, d_tiles, q_tile_size),
-                            dtype=nl.bfloat16,
-                            buffer=nl.sbuf,
+                        head_q = q_local.select(1, local_head).slice(
+                            2, q_start, q_end
                         )
-                        head_max[:, :] = nl.copy(
-                            running_max.select(1, q_chunk).select(
-                                1, local_head
-                            ),
-                            dtype=nl.float32,
-                        )
-                        head_sum[:, :] = nl.copy(
-                            running_sum.select(1, q_chunk).select(
-                                1, local_head
-                            ),
-                            dtype=nl.float32,
-                        )
-                        for state_d_tile in nl.static_range(d_tiles):
-                            head_q.select(1, state_d_tile)[:, :] = nl.copy(
-                                q_local.select(1, local_head).select(
-                                    1, state_d_tile
-                                ).slice(1, q_start, q_end),
-                                dtype=nl.bfloat16,
-                            )
-                            head_out.select(1, state_d_tile)[:, :] = nl.copy(
-                                running_out.select(1, q_chunk).select(
-                                    1, local_head
-                                ).select(1, state_d_tile),
-                                dtype=nl.float32,
-                            )
 
                         for kv_tile in nl.static_range(kv_tiles):
                             block_valid_mask = nl.load(
@@ -513,20 +478,6 @@ def make_history_attention_kernel(config: PCPAttentionConfig):
                             )
                             old_max[:, :] = nl.copy(
                                 new_max, dtype=nl.float32
-                            )
-
-                        running_max.select(1, q_chunk).select(
-                            1, local_head
-                        )[:, :] = nl.copy(head_max, dtype=nl.float32)
-                        running_sum.select(1, q_chunk).select(
-                            1, local_head
-                        )[:, :] = nl.copy(head_sum, dtype=nl.float32)
-                        for state_d_tile in nl.static_range(d_tiles):
-                            running_out.select(1, q_chunk).select(
-                                1, local_head
-                            ).select(1, state_d_tile)[:, :] = nl.copy(
-                                head_out.select(1, state_d_tile),
-                                dtype=nl.float32,
                             )
 
                 if pcp_size > 1:
